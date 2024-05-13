@@ -30,7 +30,7 @@ static bool m_uvc_started  = false;
 
 static os_mono_uvc_param_t m_param = {
     //两个镜头 VIDEOIN_ID_MIPI0 VIDEOIN_ID_MIPI1 0rgb 1ar
-    .videoin_id   = VIDEOIN_ID_MIPI1,
+    .videoin_id   = VIDEOIN_ID_MIPI0,
     .sens_type    = "sc132gs",
  //模式
     .factory_mode = 1,
