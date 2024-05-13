@@ -1,359 +1,346 @@
-#include "common_36xx_led.h"
-#include "led_driver.h"
-#include "gpio.h"
-#include "sysctl.h"
-#include "syslog.h"
+#include "os_isp_core.h"
+#include "os_mipi_cam_comm.h"
 #include "udevice.h"
-#if USE_RTOS
-#include <stdio.h>
-#else
 #include "aiva_sleep.h"
-#endif
-#include <math.h>
+#include "uvc_comm.h"
+#include "rotate.h"
+#include "mjpeg.h"
+#include "inc/os_mono_uvc_app.h"
+#include "rsz.h"
+#include "led_driver.h"
+#include "shell.h"
+#include "common_36xx_led.h"
+#include "os_startup.h"
+#include "os_init_app.h"
+#include "os_shell_app.h"
 
-static led_channel_t s_chn = CHANNEL_0;
+/*#define ISP_CALIB_MODE*/
 
-typedef struct Common_36xxParams {
-    /** current_ma = current_level * current_step_ma + current_min_ma*/
-    float current_step_ma;
-    float current_min_ma;
-    uint8_t chip_id;
-    uint8_t device_id;
-} Common_36xxParams_t;
+static char* TAG = "os_mono_uvc_app";
 
-typedef enum {
-    LM3644 = 0,
-    AW36515,
-    AW3644
-} ProductType_t;
+static pthread_t m_handle = NULL;
 
-static Common_36xxParams_t supported_36xx_products[] = {
-    [LM3644] = {
-    .current_step_ma = 11.725f,
-    .current_min_ma = 10.9f,
-    .chip_id = 0x00,
-    .device_id = 0x02,
-    },
-    [AW36515] = {
-    .current_step_ma = 7.83f,
-    .current_min_ma = 3.91f,
-    .chip_id = 0x30,
-    .device_id = 0x02,
-    },
-    [AW3644] = {
-    .current_step_ma = 11.72f,
-    .current_min_ma = 11.35f,
-    .chip_id = 0x36,
-    .device_id = 0x02,
-    }
-};
-// default is LM3644
-static ProductType_t current_36xx_type = LM3644;
+static int m_thread_created = 0;
+static videoin_context_t *m_videoin_context = NULL;
 
-#define MAX_BRIGHTNESS (0x7F)
-#define LED_BRIGHTNESS_INIT (0x20)
+static uvc_fmt_t m_uvc_fmt = UVC_MJPEG;
+static int m_uvc_w         = 640;
+static int m_uvc_h         = 480;
+static bool m_uvc_started  = false;
 
-#define TAG                             "36XX"
-#define LM3644_SLAVE_ADDR               (0x63 << 0)
-
-#define CHIP_ID_REG                     (0x00) // only aw3644 aw36515 has this reg
-#define ENABLE_REG                      (0X01)
-#define IVFM_REG                        (0x02)
-#define LED1_FLASH_REG                  (0x03)
-#define LED2_FLASH_REG                  (0x04)
-#define LED1_TORCH_REG                  (0x05)
-#define LED2_TORCH_REG                  (0x06)
-#define BOOST_REG                       (0x07)
-#define TIMING_REG                      (0x08)
-#define TEMP_REG                        (0x09)
-#define FLAGS1_REG                      (0x0A)
-#define FLAGS2_REG                      (0x0B)
-#define DEVICE_ID_REG                   (0x0C)
-#define LAST_FLASH_REG                  (0x0D)
-
-enum Common_36xx_Time_Out_Val {
-    LM3644_TIMEOUT_10MS   = 0,
-    LM3644_TIMEOUT_20MS   = 1,
-    LM3644_TIMEOUT_30MS   = 2,
-    LM3644_TIMEOUT_40MS   = 3,
-    LM3644_TIMEOUT_50MS   = 4,
-    LM3644_TIMEOUT_60MS   = 5,
-    LM3644_TIMEOUT_70MS   = 6,
-    LM3644_TIMEOUT_80MS   = 7,
-    LM3644_TIMEOUT_90MS   = 8,
-    LM3644_TIMEOUT_100MS  = 9,
-    LM3644_TIMEOUT_150MS  = 10,
-    LM3644_TIMEOUT_200MS  = 11,
-    LM3644_TIMEOUT_250MS  = 12,
-    LM3644_TIMEOUT_300MS  = 13,
-    LM3644_TIMEOUT_350MS  = 14,
-    LM3644_TIMEOUT_400MS  = 15,
+static os_mono_uvc_param_t m_param = {
+    //两个镜头 VIDEOIN_ID_MIPI0 VIDEOIN_ID_MIPI1 0rgb 1ar
+    .videoin_id   = VIDEOIN_ID_MIPI1,
+    .sens_type    = "sc132gs",
+ //模式
+    .factory_mode = 1,
+    .rot_angle    = 0,
+    //像素 1(1080*1280) 像素 2(1280*1080)
+    .ep0_desc_sel = 1,
+    .fps          = 30,
 };
 
-typedef struct _LM3644_Config_T {
-    uint8_t     reg_addr;                             // Register address
-    uint8_t     data;                                 // Data
-}LM3644_Config_T;
-
-/* 
-   if only LED_2 is connected tolm3644, setting reg 0x1 to 0x27, LED_2 won't work;
-   if LED_1 and LED_2 is connected tolm3644, setting reg 0x1 to 0x27, LED_1 and LED_2 works.
-   */   
-static LM3644_Config_T common_36xx_init_settings[] = {
-/*#ifdef USE_SL18*/
-    /*// IR mode, 0x26, enable LED2,disable LED1.*/
-    /*{0x1, 0x26},       // Reg 1  ()    */
-/*#else*/
-    /*// IR mode, 0x25, enable LED1,disable LED2.*/
-    /*{0x1, 0x25},       // Reg 1  ()    */
-/*#endif*/
-    // IR mode, 0x27, disable LED2, LED1.
-    {ENABLE_REG, 0x24},       // Reg 1  ()
-
-    {IVFM_REG, 0x01},       // Reg 2  ()
-    {LED1_FLASH_REG, LED_BRIGHTNESS_INIT},       // Reg 3  ()
-    {LED2_FLASH_REG, LED_BRIGHTNESS_INIT},       // Reg 4  ()
-    {LED1_TORCH_REG, 0x8F},       // Reg 5  ()
-    {LED2_TORCH_REG, 0x0F},       // Reg 6  ()
-    {BOOST_REG, 0x09},       // Reg 7  ()
-    /*{TIMING_REG, 0x1F},       // Reg 8  ()*/
-    {TIMING_REG, 0x13},       // Reg 8  ()  40ms
-    /*{TIMING_REG, 0x14},       // Reg 8  ()  50ms*/
-    /*{TIMING_REG, 0x11},       // Reg 8  ()  20ms*/
-    {TEMP_REG, 0x08},       // Reg 9  ()
-};
-
-typedef struct _LED_Status {
-    uint8_t     brightness_reg_addr;
-    uint8_t     brightness;                             
-} LED_Status;
-
-static LED_Status led_status[] = {
-    {LED1_FLASH_REG, LED_BRIGHTNESS_INIT},
-    {LED2_FLASH_REG, LED_BRIGHTNESS_INIT}
-};
-
-static int Common_36xx_Write_Reg(i2c_device_number_t dev, uint8_t i2c_addr, uint8_t reg, uint8_t data)
+static void user_start_cb(uvc_fmt_t fmt, int w, int h, int fps)
 {
-    int ret;
-    uint8_t data_buf[2];
 
-    data_buf[0] = reg;
-    data_buf[1] = data;
-    ret = i2c_send_data(dev, i2c_addr, data_buf, 2);
-    CHECK_RET(ret);
-
-    return ret;
+    m_uvc_fmt = fmt;
+    m_uvc_w = w;//图像宽
+    m_uvc_h = h;//图像高
+    m_uvc_started = true;
+    LOGI(__func__, "fmt %d, w %d, h %d, fps:%d", fmt, w, h, fps);
 }
 
-static uint8_t Common_36xx_Read_Reg(i2c_device_number_t dev, uint8_t i2c_addr, uint8_t reg_addr)
+static void user_stop_cb(void)
 {
-    int ret;
-    uint8_t reg_val;
-
-    ret = i2c_send_data(dev, i2c_addr, &reg_addr, 1);
-    CHECK_RET(ret);
-
-    ret = i2c_recv_data(dev, i2c_addr, 0, 0, &reg_val, 1);
-    CHECK_RET(ret);
-
-    return reg_val;
+    m_uvc_started = false;//停止uvc
 }
 
-static int Common_36xx_Get_Lock(led_dev_t *dev)
+
+static void *os_mono_uvc_app_thread_entry(void *param)
 {
+    (void)param;
+    LOGI(__func__, "Start...");
+
+    frame_buf_t *frame_uvc;
+
+    uint8_t discard_cnt = 0;
     int ret = 0;
-#ifdef USE_RTOS
-    if (!xPortIsInISR()) {
-        ret = pthread_mutex_lock(&(((Common_led_t*)dev->priv)->mutex));
-    }
-#endif
-    return ret;
-}
+    int fps = m_param.fps;
+    uint32_t ms_per_frame = 1000 / fps;
+    uint32_t prev_time = 0;
 
-static int Common_36xx_Release_Lock(led_dev_t *dev)
-{
-    int ret = 0;
-#ifdef USE_RTOS
-    if (!xPortIsInISR()) {
-        ret = pthread_mutex_unlock(&(((Common_led_t*)dev->priv)->mutex));
-    }
-#endif
-    return ret;
-}
+    int rot_angle = m_param.rot_angle;
 
-static enum Common_36xx_Time_Out_Val Timeout_Ms2Level(int timeout_ms)
-{
-    enum Common_36xx_Time_Out_Val timeout_level = LM3644_TIMEOUT_10MS;
-    if (timeout_ms < 5)
-    {
-        timeout_level = LM3644_TIMEOUT_10MS;
-    }
-    else if (timeout_ms >= 5 && timeout_ms <= 100)
-    {
-        timeout_level = (enum Common_36xx_Time_Out_Val)((timeout_ms + 5) / 10 - 1);
-    }
-    else if (timeout_ms <= 400)
-    {
-        timeout_level = (enum Common_36xx_Time_Out_Val)((timeout_ms + 25) / 50 - 2 + LM3644_TIMEOUT_100MS);
-    }
-    else
-    {
-        timeout_level = LM3644_TIMEOUT_400MS;
-    }
-
-    return timeout_level;
-}
-
-static int Common_36xx_Set_Flash_Timeout(led_dev_t *dev, int timeout_level)//设置闪光灯的超时时间
-{
-    Common_36xx_Get_Lock(dev);//代码获取一个锁，以确保在设置超时时间期间不会被其他操作打断
-
-    Common_led_t *_dev = (Common_led_t *)dev->priv;
-    i2c_device_number_t i2c_num = _dev->i2c_num;
-    i2c_init(i2c_num, _dev->i2c_addr, _dev->i2c_addr_width, _dev->i2c_clk);
-
-    int ret = Common_36xx_Write_Reg(i2c_num,
-            _dev->i2c_addr,
-            TIMING_REG, 
-            timeout_level);
-
-    Common_36xx_Release_Lock(dev);
-
-    return ret;
-}
-
-// void Common_36xx_Test(void)
-// {    
-//     Common_36xx_Init(I2C_DEVICE_2, GPIO_PIN3, true);
-//     Common_36xx_Set_Flash_Timeout(LM3644_TIMEOUT_10MS);
-
-//     while (1)
-//     {
-//         Common_36xx_Power_Off();        
-//         Common_36xx_Power_On();
-//         Common_36xx_Busy_Delay(3000);
-//     }
-// }
-
-
-#ifdef __cplusplus
- extern "C" {
-#endif
-
-#if USE_RTOS
-static void Timeout_Cb(TimerHandle_t timer)
-{
-    led_dev_t* led_dev = (led_dev_t*)pvTimerGetTimerID(timer);
-    Common_led_t* common_36xx_dev = (Common_led_t*)led_dev->priv;
-    gpio_pin_value_t pin_val = gpio_get_pin(common_36xx_dev->power_pin);
-    if(pin_val == GPIO_PV_LOW)
-    {
-        // set power pin high to turn on led, and start timer to turn off led when timeout 
-        gpio_set_pin(common_36xx_dev->power_pin, GPIO_PV_HIGH);
-       // LOGI("", "%d GPIO_PV_HIGH\n", (int)common_36xx_dev->power_pin);
-        //
-        TimerHandle_t _timer = common_36xx_dev->timer;
-        TickType_t period = xTimerGetPeriod(_timer);
-       TickType_t expect_period = led_dev->timeout_ms[s_chn] / portTICK_PERIOD_MS;
-        if (period!= expect_period)
-        {
-            xTimerChangePeriod(_timer, expect_period, 0);
+//led
+  static led_dev_t *led_dev = NULL;
+     Shell *shell = NULL;
+     //0是ir上灯，1是rgb上灯。
+     led_channel_t led_channel = CHANNEL_1;
+        //电流和亮的时间
+        int current_value_ma = 10;
+        int timeout_value_ms = 200;
+        char *dev_name = "lm3644";
+        led_dev = led_find_device(dev_name);
+        if (led_dev == NULL) {
+            shellPrint(shell, "Can not find %s led device!\n", dev_name);
+            //return 0;
         }
-        xTimerStart(_timer, 0);
-    }
-    else
-    {
-        // reset power pin to turn off led
-       // LOGI("", "%d GPIO_PV_LOW\n", (int)common_36xx_dev->power_pin);
-        gpio_set_pin(common_36xx_dev->power_pin, GPIO_PV_LOW);
-    }
-}
-#endif
+        // step 1: init led
+        ret = led_init(led_dev);//初始化lm3644设备
+        if (ret != 0) {
+            shellPrint(shell, "Initialize %s led device failed!\n", dev_name); //初始化失败
+           // return 0;
+        }
+        // step 2: led enable
+        led_enable(led_dev, led_channel);
+        // step 3: set curretma
+        led_set_current(led_dev, led_channel, current_value_ma);
+        // step 4: set timeout
+        led_set_timeout(led_dev, led_channel, timeout_value_ms);
+        // step 5: set trigger param
+        led_trig_param_t trigger_param = {.pulse_in_us = 2000,};
+        led_set_trigger_param(led_dev, &trigger_param);
+        led_suspend(led_dev, led_channel);
 
-int Common_36xx_Init(led_dev_t *dev)
-{
-    Common_led_t* _dev = (Common_led_t*)dev->priv;
-    uint8_t pin = _dev->power_pin;
-    int timeout_ms = dev->timeout_ms;
- 
-    i2c_device_number_t i2c_num = _dev->i2c_num;
+       //    int test_cnt = 0;
+       //让程序暂停10毫秒
+        //aiva_usleep(10 * 1000);
+        
 
-    Common_36xx_Get_Lock(dev);
-
-    i2c_init(i2c_num, _dev->i2c_addr, _dev->i2c_addr_width, _dev->i2c_clk);
+//取图
     
-    // read 0x00 to get product id
-    uint8_t chip_id = Common_36xx_Read_Reg(i2c_num, _dev->i2c_addr, CHIP_ID_REG);
-#if 0 // LM3644 not tell us what will return when read 0x00, so we can not assume it not return 0x30 0r 0x36
-    for (size_t i = 0; i < sizeof(supported_36xx_Products) / sizeof(supported_36xx_Products[0]); i++)
+    while (m_thread_created)
     {
-        if (supported_36xx_Products[i].chip_id == chip_id)
-        {
-            current_36xx_type = (ProductType_t)i;
-            break;
+ 
+     videoin_frame_t videoin_frame;
+     prev_time = aiva_get_curr_ms();  
+
+
+     //LED
+   
+
+        led_resume(led_dev, led_channel);
+
+        //LOGI("","led led_trigger...");
+         led_trigger(led_dev, led_channel);
+         //aiva_usleep(timeout_value_ms * 1000);
+        
+        
+
+        ret = videoin_get_frame(m_videoin_context, &videoin_frame, VIDEOIN_WAIT_FOREVER);//获取图像帧
+
+        if (ret < 0) {
+            LOGE(__func__, "videoin_get_frame() error!");//获取失败，提示信息
+            sleep(1);//睡眠一秒钟
+            continue;//跳转while循环,重新获取图像
         }
+        frame_buf_t *frame_buf = videoin_frame.frame_buf[0];
+        /*LOGD(__func__, "get frame_buf 0x%08x", frame_buf);*/
+
+        if (m_uvc_started) {
+            if ((m_uvc_fmt != UVC_GRAY8) && (m_uvc_fmt != UVC_MJPEG)) {
+                LOGE(__func__, "Unsupported format(%d)!", m_uvc_fmt);
+                frame_mgr_decr_ref(frame_buf);
+                sleep(1);
+                continue;
+            }
+
+            if (rot_angle != 0) {
+                int rotate_mode = ROT_MOD_CLK_90;
+                switch (rot_angle) {
+                    case 90:
+                        rotate_mode = ROT_MOD_CLK_90;
+                        break;
+                    case 180:
+                        rotate_mode = ROT_MOD_CLK_180;
+                        break;
+                    case 270:
+                        rotate_mode = ROT_MOD_CLK_270;
+                        break;
+                    default:
+                        LOGE(__func__, "Unsupported rot angle %d", rot_angle);
+                        break;
+                }
+
+                frame_buf_t *frame_rot = rotate_frame(frame_buf, rotate_mode, 0);
+                frame_mgr_decr_ref(frame_buf);
+                frame_buf = frame_rot;
+            }
+
+            if (frame_buf->fmt == FRAME_FMT_RAW8) {
+                if (frame_buf->width != m_uvc_w || frame_buf->height != m_uvc_h) {
+                    frame_buf_t *frame_rsz = rsz_resize(frame_buf, m_uvc_w, m_uvc_h, RSZ_GRAY2GRAY);
+                    frame_mgr_decr_ref(frame_buf);
+                    frame_buf = frame_rsz;
+                }
+            }
+
+            if (m_uvc_fmt == UVC_MJPEG) {
+                frame_uvc = mjpeg_compress(frame_buf, MJPEG_COMP_LEVEL_HIGH);
+                frame_mgr_decr_ref(frame_buf);
+            }
+            else {
+                frame_uvc = frame_buf;
+            }
+
+            if (discard_cnt < 5) {
+                frame_mgr_decr_ref(frame_uvc);
+                ++discard_cnt;
+            }
+            else {
+                /*LOGD(__func__, "0x%x, 0x%x", frame_uvc->data[0][0], frame_uvc->data[0][1]);*/
+                uvc_commit_frame(frame_uvc);
+            }
+        }
+        else {
+            frame_mgr_decr_ref(frame_buf);
+        }
+        
+        uint32_t remain_ms = 0;
+        uint32_t cur_time = aiva_get_curr_ms();
+
+        if (cur_time > prev_time) {
+            if (cur_time - prev_time < ms_per_frame) {
+                remain_ms = ms_per_frame - (cur_time - prev_time);
+            }
+        }
+
+        if (remain_ms > 0) {
+            usleep(remain_ms * 1000);
+        }
+
+        prev_time = cur_time;
+
+    
+     
     }
+
+    return NULL;
+}
+
+int os_mono_uvc_app_entry(void)
+{
+    int ret;
+    pthread_attr_t attr;
+    
+    const char *uvc_dev_name = NULL;
+
+    /* Mount file system */
+    os_mount_fs();
+
+    /* Start shell */
+    os_shell_app_entry();
+
+    if (m_thread_created) {
+        return 0;
+    }
+
+    videoin_id_t id = m_param.videoin_id;
+    const char *sens_type = m_param.sens_type;
+
+    if (m_param.factory_mode) {
+       uvc_dev_name = "uvc_isoc_camera";
+    }
+    else {
+       uvc_dev_name = "uvc_bulk_gadget";
+    }
+
+    m_thread_created = 1;
+
+    cis_dev_driver_t *drv[3];
+
+    ret = cis_find_dev_driver_list(sens_type, &drv[0], 3);
+    if (ret < 0) {
+        LOGE(__func__, "Can't find sensor '%s' ...", sens_type);
+		goto fail_out;
+    }
+
+    // init MIPI and sensor
+    os_mipi_mono_cam_param_t mono_cam_param = OS_MIPI_MONO_CAM_PARAM_INITIALIZER;
+    mono_cam_param.id = id;
+    mono_cam_param.drv = drv[id];
+#ifndef ISP_CALIB_MODE
+    mono_cam_param.frame_fmt = FRAME_FMT_RAW8;
 #else
-    if (chip_id == supported_36xx_Products[AW36515].chip_id)
-    {
-        current_36xx_type = AW36515;
+    mono_cam_param.frame_fmt = FRAME_FMT_MAX;
+#endif
+    mono_cam_param.skip_power_on = 0;
+    m_videoin_context = mipi_mono_camera_init(&mono_cam_param);
+    if (m_videoin_context == NULL) {
+        goto fail_out;
     }
-    else if (chip_id == supported_36xx_Products[AW3644].chip_id)
-    {
-        current_36xx_type = AW3644;
-    }
+
+    uvc_param_t uvc_param = UVC_PARAM_INITIALIZER;
+
+    uvc_param.ep0_desc_sel     = m_param.ep0_desc_sel;
+#ifndef ISP_CALIB_MODE
+    uvc_param.max_payload_size = 512;
+#else
+    uvc_param.max_payload_size = 16 * 1024;
 #endif
 
-    int ret = 0;
-    for (int i = 0; i < (int)AIVA_ARRAY_LEN(common_36xx_init_settings); i++)
-    {
-        ret = Common_36xx_Write_Reg(i2c_num,
-                _dev->i2c_addr,
-                common_36xx_init_settings[i].reg_addr, 
-                common_36xx_init_settings[i].data);
-        if (ret!= 0)
-        {
-            Common_36xx_Release_Lock(dev);
-            goto out;
+    // init uvc device
+    if (uvc_init(uvc_dev_name, &uvc_param) != 0) {
+        LOGE(__func__, "Init uvc dev '%s' error!", uvc_dev_name);
+        goto fail_out;
+    }
+ 
+    // register UVC callback
+    uvc_register_user_start_cb(user_start_cb);
+    uvc_register_user_stop_cb(user_stop_cb);
+
+
+    port_set_pthread_name("mono_uvc_app");
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 16*1024);
+
+    ret = pthread_create(&m_handle, &attr, os_mono_uvc_app_thread_entry, NULL);
+    if (ret < 0) {
+        goto fail_out;
+    }
+
+    return 0;
+
+fail_out:
+    os_mono_uvc_app_exit();
+    return -1;
+}
+
+int os_mono_uvc_app_exit(void)
+{
+    LOGI(__func__, "exit os_mono_uvc_app() ...");
+
+    if (m_thread_created) {
+        m_thread_created = 0;
+        if (m_handle != NULL) {
+            LOGD(__func__, "pthread_join...");
+            pthread_join(m_handle, NULL);
+            m_handle = NULL;
         }
-    }
-
-    // enum Common_36xx_Time_Out_Val timeout_level = Timeout_Ms2Level(timeout_ms);
-    // Common_36xx_Write_Reg(i2c_num,
-    //     _dev->i2c_addr, 
-    //     TIMING_REG, 
-    //     timeout_level);
-
-    Common_36xx_Release_Lock(dev);
-
-    Sysctl_Io_Switch_t io_switch = IO_SWITCH_GPIO0 + pin;
-    Sysctl_Set_Io_Switch(io_switch, 1);
-
-    if (_dev->use_strobe)
-    {
-        gpio_set_drive_mode(pin, GPIO_DM_INPUT);
-    }
-    else
-    {
-        gpio_set_drive_mode(pin, GPIO_DM_OUTPUT);
-#if USE_RTOS
-        int pulse_in_ms = 2;
-        const led_trig_param_t *trig = dev->trig_param;
-        if (trig!= NULL && trig->pulse_in_us >= 2000 && trig->pulse_in_us <= 10000)
-        {
-            pulse_in_ms = (trig->pulse_in_us / 1000);
+        if (m_videoin_context != NULL) {
+            LOGD(__func__, "mipi_mono_camera_uninit ...");
+            mipi_mono_camera_uninit(m_videoin_context);
+			m_videoin_context = NULL;
         }
-        char timer_name[20] = {0};
-        snprintf(timer_name, sizeof(timer_name) / sizeof(timer_name[0]), "LM3644%d_LED_TIMER", (int)pin);
-        // create software timer
-        _dev->timer = xTimerCreate
-                    (timer_name,
-                    pdMS_TO_TICKS(pulse_in_ms),
-                    0,
-                    (void *)dev,
-                    Timeout_Cb);
-#endif
+        LOGD(__func__, "uvc_cleanup()...");
+        uvc_cleanup();
     }
 
-    LOGI(TAG, "%s done\n", current_36xx_type == AW3644? "AW3644" : (current_36xx_type == AW36515? "
+    return 0;    
+}
+
+int main(int argc, char *argv[])
+{
+    (void)argc;
+    (void)argv;
+
+    LOGI(TAG, "AIVA MIPI MONO UVC EXAMPLE");
+
+    /* Register custom entry */
+    os_app_set_custom_entry(os_mono_uvc_app_entry);
+
+    /* Start scheduler, dead loop */
+    os_app_main_entry();
+
+    return 0;
+}
